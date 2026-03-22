@@ -35,10 +35,13 @@ const cardStyle = {
   padding: "16px 18px", marginBottom: 10,
 };
 
-// ── Lock Screen ─────────────────────────────────────────────────────────────
+// ── Lock Screen (passphrase + device-bound OTP) ─────────────────────────────
 
 function LockScreen({ onUnlock }) {
-  const [pin, setPin] = useState("");
+  const [step, setStep] = useState("passphrase"); // passphrase | otp
+  const [passphrase, setPassphrase] = useState("");
+  const [otpCode, setOtpCode] = useState("");
+  const [deviceFp, setDeviceFp] = useState("");
   const [error, setError] = useState("");
   const [attempts, setAttempts] = useState(null);
   const [locked, setLocked] = useState(false);
@@ -51,70 +54,125 @@ function LockScreen({ onUnlock }) {
     return () => clearInterval(t);
   }, [retryAfter]);
 
-  const submit = async (fullPin) => {
-    if (locked || loading) return;
+  const submitPassphrase = async () => {
+    if (locked || loading || !passphrase.trim()) return;
     setLoading(true);
     setError("");
     try {
       const data = await fetch("/auth/login", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pin: fullPin }),
+        body: JSON.stringify({ passphrase: passphrase.trim() }),
       }).then(r => r.json());
 
-      if (data.token) { setToken(data.token); onUnlock(); }
-      else if (data.locked) { setLocked(true); setRetryAfter(data.retry_after || 1800); setPin(""); }
-      else { setError(data.error || "Invalid PIN"); setAttempts(data.attempts_left); setPin(""); }
-    } catch { setError("Connection failed"); setPin(""); }
+      if (data.token) {
+        setToken(data.token);
+        onUnlock();
+      } else if (data.needs_otp) {
+        setDeviceFp(data.device_fp);
+        setStep("otp");
+        setError("");
+      } else if (data.locked) {
+        setLocked(true);
+        setRetryAfter(data.retry_after || 1800);
+      } else {
+        setError(data.error || "Invalid passphrase");
+        setAttempts(data.attempts_left);
+      }
+    } catch { setError("Connection failed"); }
     setLoading(false);
   };
 
-  const tap = (n) => {
-    if (pin.length >= 6) return;
-    const next = pin + n;
-    setPin(next);
-    if (next.length >= 4) submit(next);
+  const submitOtp = async () => {
+    if (locked || loading || !otpCode.trim()) return;
+    setLoading(true);
+    setError("");
+    try {
+      const data = await fetch("/auth/verify", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device_fp: deviceFp, code: otpCode.trim() }),
+      }).then(r => r.json());
+
+      if (data.token) {
+        setToken(data.token);
+        onUnlock();
+      } else if (data.locked) {
+        setLocked(true);
+        setRetryAfter(data.retry_after || 1800);
+      } else {
+        setError(data.error || "Invalid code");
+      }
+    } catch { setError("Connection failed"); }
+    setLoading(false);
   };
 
-  const keys = ["1","2","3","4","5","6","7","8","9","","0","⌫"];
+  const inputStyle = {
+    width: "100%", maxWidth: 320, background: C.card, border: `1px solid ${C.border}`,
+    borderRadius: 12, color: C.text, padding: "14px 18px", fontSize: 16,
+    outline: "none", textAlign: "center", letterSpacing: "0.05em",
+  };
+
+  const btnStyle = {
+    width: "100%", maxWidth: 320, padding: "14px 24px", borderRadius: 12,
+    border: "none", fontSize: 15, fontWeight: 600, cursor: "pointer",
+    letterSpacing: "0.04em", marginTop: 12, transition: "all 0.15s",
+  };
 
   return (
     <div style={{
       position: "fixed", inset: 0, background: C.bg, zIndex: 9999,
       display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
-      padding: "0 40px",
+      padding: "0 32px",
     }}>
       <div style={{ letterSpacing: "0.3em", fontSize: 13, color: C.muted, textTransform: "uppercase", marginBottom: 8 }}>JoshOS</div>
-      <div style={{ fontSize: 28, fontWeight: 700, color: C.text, letterSpacing: "0.08em", marginBottom: 40 }}>Enter PIN</div>
 
-      <div style={{ display: "flex", gap: 14, marginBottom: 32 }}>
-        {[0,1,2,3,4,5].map(i => (
-          <div key={i} style={{
-            width: 14, height: 14, borderRadius: "50%",
-            background: i < pin.length ? C.accent : "transparent",
-            border: `2px solid ${i < pin.length ? C.accent : C.dim}`,
-            transition: "all 0.15s",
-          }} />
-        ))}
-      </div>
+      {step === "passphrase" && (
+        <>
+          <div style={{ fontSize: 24, fontWeight: 700, color: C.text, letterSpacing: "0.05em", marginBottom: 32 }}>Enter Passphrase</div>
+          <input
+            type="password" value={passphrase}
+            onChange={e => setPassphrase(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && submitPassphrase()}
+            placeholder="your-passphrase-here"
+            autoFocus autoComplete="current-password"
+            style={inputStyle}
+          />
+          <button onClick={submitPassphrase} disabled={loading || locked || !passphrase.trim()}
+            style={{ ...btnStyle, background: loading ? C.dim : C.accent, color: "#fff", opacity: loading ? 0.5 : 1 }}>
+            {loading ? "Verifying..." : "Unlock"}
+          </button>
+        </>
+      )}
 
-      {error && <div style={{ color: C.red, fontSize: 13, marginBottom: 12, textAlign: "center" }}>
-        {error}{attempts !== null && ` (${attempts} left)`}
+      {step === "otp" && (
+        <>
+          <div style={{ fontSize: 24, fontWeight: 700, color: C.text, letterSpacing: "0.05em", marginBottom: 12 }}>New Device</div>
+          <div style={{ color: C.muted, fontSize: 13, marginBottom: 24, textAlign: "center", maxWidth: 300, lineHeight: 1.6 }}>
+            A verification code was sent to your email. Enter it below to register this device.
+          </div>
+          <input
+            type="text" inputMode="numeric" value={otpCode}
+            onChange={e => setOtpCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+            onKeyDown={e => e.key === "Enter" && submitOtp()}
+            placeholder="000000" autoFocus
+            style={{ ...inputStyle, fontSize: 28, letterSpacing: "0.3em" }}
+          />
+          <button onClick={submitOtp} disabled={loading || locked || otpCode.length < 6}
+            style={{ ...btnStyle, background: loading ? C.dim : C.green, color: "#fff", opacity: loading ? 0.5 : 1 }}>
+            {loading ? "Verifying..." : "Verify Device"}
+          </button>
+          <button onClick={() => { setStep("passphrase"); setOtpCode(""); setError(""); }}
+            style={{ ...btnStyle, background: "transparent", color: C.muted, border: `1px solid ${C.border}` }}>
+            ← Back
+          </button>
+        </>
+      )}
+
+      {error && <div style={{ color: C.red, fontSize: 13, marginTop: 16, textAlign: "center" }}>
+        {error}{attempts !== null && attempts > 0 && ` (${attempts} attempts left)`}
       </div>}
-      {locked && <div style={{ color: C.amber, fontSize: 13, marginBottom: 12 }}>
+      {locked && <div style={{ color: C.amber, fontSize: 13, marginTop: 12 }}>
         Locked — {Math.floor(retryAfter/60)}:{(retryAfter%60).toString().padStart(2,"0")}
       </div>}
-
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 72px)", gap: 12 }}>
-        {keys.map((k, i) => (
-          <button key={i} disabled={!k || locked} onClick={() => k === "⌫" ? setPin(p => p.slice(0,-1)) : tap(k)}
-            style={{
-              width: 72, height: 56, borderRadius: 12, border: "none", fontSize: 22, fontWeight: 500,
-              background: k ? C.card : "transparent", color: C.text, cursor: k ? "pointer" : "default",
-              opacity: k ? (locked ? 0.3 : 1) : 0, transition: "all 0.1s",
-            }}
-          >{k}</button>
-        ))}
-      </div>
     </div>
   );
 }

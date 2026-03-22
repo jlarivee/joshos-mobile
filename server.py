@@ -24,7 +24,7 @@ import jwt
 
 # ── Validate secrets on startup ──────────────────────────────────────────────
 
-REQUIRED_SECRETS = ["JOSHOS_PIN", "ANTHROPIC_API_KEY"]
+REQUIRED_SECRETS = ["JOSHOS_PASSPHRASE", "ANTHROPIC_API_KEY"]
 missing = [s for s in REQUIRED_SECRETS if not os.environ.get(s)]
 if missing:
     print(f"FATAL: Missing required secrets: {', '.join(missing)}", file=sys.stderr)
@@ -32,8 +32,11 @@ if missing:
     sys.exit(1)
 
 JWT_SECRET = os.environ.get("JWT_SECRET_KEY") or secrets.token_hex(32)
-JOSHOS_PIN = os.environ["JOSHOS_PIN"]
+JOSHOS_PASSPHRASE = os.environ["JOSHOS_PASSPHRASE"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+SMTP_USER = os.environ.get("BRIEFING_EMAIL_USER", "")
+SMTP_PASS = os.environ.get("BRIEFING_EMAIL_PASSWORD", "")
+JOSHOS_EMAIL = "jlarivee@gmail.com"
 
 # ── App setup ────────────────────────────────────────────────────────────────
 
@@ -49,50 +52,97 @@ for d in [BRIEFINGS_DIR, CONTACTS_DIR]:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("joshos-mobile")
 
-# ── Rate limiting (simple in-memory) ─────────────────────────────────────────
+# ── Rate limiting (in-memory) ─────────────────────────────────────────────────
 
 _login_attempts = {}  # ip -> {"count": int, "first_at": float, "locked_until": float}
 
 def check_rate_limit(ip):
-    """Returns (allowed: bool, retry_after: int or None)."""
     now = time.time()
     rec = _login_attempts.get(ip, {"count": 0, "first_at": now, "locked_until": 0})
-
     if now < rec.get("locked_until", 0):
-        remaining = int(rec["locked_until"] - now)
-        return False, remaining
-
-    # Reset window if > 10 minutes since first attempt
+        return False, int(rec["locked_until"] - now)
     if now - rec.get("first_at", now) > 600:
         rec = {"count": 0, "first_at": now, "locked_until": 0}
-
     return True, None
 
 def record_failed_attempt(ip):
     now = time.time()
     rec = _login_attempts.get(ip, {"count": 0, "first_at": now, "locked_until": 0})
-
     if now - rec.get("first_at", now) > 600:
         rec = {"count": 0, "first_at": now, "locked_until": 0}
-
     rec["count"] = rec.get("count", 0) + 1
-
     if rec["count"] >= 5:
-        rec["locked_until"] = now + 1800  # 30 minute lockout
+        rec["locked_until"] = now + 1800
         rec["count"] = 0
         rec["first_at"] = now
-
     _login_attempts[ip] = rec
     return rec["count"]
 
 def reset_attempts(ip):
     _login_attempts.pop(ip, None)
 
+# ── Device binding + OTP ─────────────────────────────────────────────────────
+
+DEVICES_FILE = DATA_DIR / "known_devices.json"
+PENDING_OTP = {}  # device_fp -> {"code": str, "expires": float, "passphrase_ok": bool}
+
+def load_known_devices():
+    if DEVICES_FILE.exists():
+        return json.loads(DEVICES_FILE.read_text())
+    return {}
+
+def save_known_devices(devices):
+    DEVICES_FILE.write_text(json.dumps(devices, indent=2))
+
+def compute_device_fingerprint(req):
+    ua = req.headers.get("User-Agent", "")
+    accept_lang = req.headers.get("Accept-Language", "")
+    raw = f"{ua}|{accept_lang}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+def is_known_device(fingerprint):
+    devices = load_known_devices()
+    return fingerprint in devices
+
+def register_device(fingerprint, ip):
+    devices = load_known_devices()
+    devices[fingerprint] = {
+        "first_seen": datetime.now().isoformat(),
+        "last_login": datetime.now().isoformat(),
+        "ip": ip,
+        "login_count": devices.get(fingerprint, {}).get("login_count", 0) + 1,
+    }
+    save_known_devices(devices)
+
+def generate_otp():
+    return f"{secrets.randbelow(900000) + 100000}"
+
+def send_otp_email(code):
+    if not SMTP_USER or not SMTP_PASS:
+        logger.warning("SMTP not configured — cannot send OTP")
+        return False
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        msg = MIMEText(f"Your JoshOS verification code is: {code}\n\nThis code expires in 10 minutes. If you didn't request this, someone is trying to access your JoshOS Mobile app.")
+        msg["Subject"] = f"JoshOS Verification: {code}"
+        msg["From"] = SMTP_USER
+        msg["To"] = JOSHOS_EMAIL
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SMTP_USER, JOSHOS_EMAIL, msg.as_string())
+        logger.info(f"OTP sent to {JOSHOS_EMAIL}")
+        return True
+    except Exception as e:
+        logger.error(f"OTP email failed: {e}")
+        return False
+
 # ── JWT helpers ──────────────────────────────────────────────────────────────
 
-def create_token():
+def create_token(device_fp):
     payload = {
         "sub": "josh",
+        "device": device_fp,
         "iat": datetime.utcnow(),
         "exp": datetime.utcnow() + timedelta(hours=12),
         "jti": str(uuid.uuid4()),
@@ -102,9 +152,7 @@ def create_token():
 def verify_token(token):
     try:
         return jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-    except jwt.ExpiredSignatureError:
-        return None
-    except jwt.InvalidTokenError:
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
         return None
 
 def require_auth(f):
@@ -113,8 +161,7 @@ def require_auth(f):
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
             return jsonify({"error": "Authentication required", "code": 401}), 401
-        token = auth_header[7:]
-        payload = verify_token(token)
+        payload = verify_token(auth_header[7:])
         if not payload:
             return jsonify({"error": "Invalid or expired token", "code": 401}), 401
         return f(*args, **kwargs)
@@ -142,6 +189,7 @@ def run_job(job_id, script_name):
 
 @app.route("/auth/login", methods=["POST"])
 def login():
+    """Step 1: Passphrase check. If new device, sends OTP and returns needs_otp=true."""
     ip = request.remote_addr
     allowed, retry_after = check_rate_limit(ip)
 
@@ -152,19 +200,71 @@ def login():
         }), 429
 
     body = request.get_json() or {}
-    pin = body.get("pin", "")
+    passphrase = body.get("passphrase", "")
 
-    if not pin or pin != JOSHOS_PIN:
+    if not passphrase or passphrase != JOSHOS_PASSPHRASE:
         remaining = record_failed_attempt(ip)
         attempts_left = max(0, 5 - remaining)
-        return jsonify({
-            "error": "Invalid PIN",
-            "code": 403,
-            "attempts_left": attempts_left,
-        }), 403
+        return jsonify({"error": "Invalid passphrase", "code": 403, "attempts_left": attempts_left}), 403
 
     reset_attempts(ip)
-    token = create_token()
+    device_fp = compute_device_fingerprint(request)
+
+    # Known device — issue token immediately
+    if is_known_device(device_fp):
+        register_device(device_fp, ip)
+        token = create_token(device_fp)
+        return jsonify({"token": token, "expires_in": 43200})
+
+    # New device — generate OTP and require verification
+    code = generate_otp()
+    PENDING_OTP[device_fp] = {
+        "code": code,
+        "expires": time.time() + 600,  # 10 minutes
+        "passphrase_ok": True,
+        "ip": ip,
+    }
+    sent = send_otp_email(code)
+    logger.info(f"New device {device_fp[:8]}... — OTP requested (email sent: {sent})")
+
+    return jsonify({
+        "needs_otp": True,
+        "device_fp": device_fp,
+        "message": "Verification code sent to your email",
+        "email_sent": sent,
+    })
+
+
+@app.route("/auth/verify", methods=["POST"])
+def verify_otp():
+    """Step 2: OTP verification for new devices."""
+    ip = request.remote_addr
+    allowed, retry_after = check_rate_limit(ip)
+    if not allowed:
+        return jsonify({"error": f"Locked. Try again in {retry_after // 60} minutes.", "code": 429, "locked": True}), 429
+
+    body = request.get_json() or {}
+    device_fp = body.get("device_fp", "")
+    code = body.get("code", "")
+
+    pending = PENDING_OTP.get(device_fp)
+    if not pending:
+        return jsonify({"error": "No pending verification. Start over.", "code": 403}), 403
+
+    if time.time() > pending["expires"]:
+        PENDING_OTP.pop(device_fp, None)
+        return jsonify({"error": "Code expired. Start over.", "code": 403}), 403
+
+    if code != pending["code"]:
+        record_failed_attempt(ip)
+        return jsonify({"error": "Invalid code", "code": 403}), 403
+
+    # OTP correct — register device and issue token
+    PENDING_OTP.pop(device_fp, None)
+    register_device(device_fp, ip)
+    token = create_token(device_fp)
+    logger.info(f"New device {device_fp[:8]}... verified and registered")
+
     return jsonify({"token": token, "expires_in": 43200})
 
 # ── API routes ───────────────────────────────────────────────────────────────
