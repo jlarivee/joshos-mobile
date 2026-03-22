@@ -1,0 +1,15 @@
+run = "python3 server.py"
+entrypoint = "server.py"
+
+[nix]
+channel = "stable-24_05"
+
+[env]
+PORT = "5000"
+
+[deployment]
+run = ["python3", "server.py"]
+
+[[ports]]
+localPort = 5000
+externalPort = 80

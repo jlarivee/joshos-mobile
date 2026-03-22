@@ -1,0 +1,14 @@
+{
+  "name": "JoshOS",
+  "short_name": "JoshOS",
+  "description": "Josh Larivee's AI Operating System",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#08080c",
+  "theme_color": "#08080c",
+  "orientation": "portrait",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}
